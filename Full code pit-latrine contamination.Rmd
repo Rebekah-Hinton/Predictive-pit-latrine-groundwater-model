@@ -1,0 +1,659 @@
+titlD: "Pit-latrine contamination estimates"
+output: html_document
+datD: '2022-06-24'
+---
+Develop a 'unique' population raster file for Malawi. Giving the population of Malawi (taken from 2000 population data) combined with proximity to roads and population centres to weight growth towards areas within proximity of settlements and roads
+
+Load packages
+```{r}
+library(sf)
+library(raster)
+library(rgdal)
+#library(SDMTools)
+library(rgeos) 
+library(raster)
+library(rgdal)
+library(rworldmap)
+library(maptools)
+```
+
+Take shapefile outline of Malawi to clip population
+```{r}
+download.file("http://www.naturalearthdata.com/http//www.naturalearthdata.com/download/10m/cultural/ne_10m_admin_0_countries.zip", "countries.zip")
+# Then unzip
+unzip("countries.zip")
+
+# Read in the shapefile
+world <- readShapeSpatial("ne_10m_admin_0_countries.shp")
+
+plot(world[world$ADMIN=="Malawi",1])
+
+Malawi<- world[world$ADMIN=="Malawi",1]
+```
+
+Load Malawi population 2000 data taken from Data Guru. Gives population to 100m resoltion (hence use of this data)
+World Pop hub: https://hub.worldpop.org/geodata/summary?id=123
+```{r}
+pop_2000_file <- raster(paste0('D:/SMaWal/Latrine management/Data/Population/Worldpop/mwi_ppp_2000_UNadj.tif'))
+pop_2000<- crop(pop_2000_file,Malawi)
+plot(pop_2000)
+```
+
+Load data on roads from MASDAP so Malawi specific. http://www.masdap.mw/layers/geonodD:malawi_major_roads
+```{r}
+roads_Malawi<- readShapeSpatial('D:/SMaWal/Latrine management/Data/Population/Data Guru/malawi_major_roads/malawi_major_roads.shp')
+crs(roads_Malawi)<- CRS('+init=EPSG:32736')
+```
+
+
+Generate an empty raster to be used to take the road shape file and convert to a raster of the distance from roads. First outline the size of the raster (taking the extent of the downloaded roads_Malawi dataset), create a raster to these specifications.
+```{r}
+extent (roads_Malawi)
+
+library(rgeos) 
+xmin       <- (477807.6 )
+xmax       <- (805224.8) 
+ymin       <- (8105221)
+ymax       <- (8962213)
+
+distance_raster<- raster(matrix(1:12,953,361), xmn=xmin, xmx=xmax, ymn=ymin, ymx=ymax)
+crs(distance_raster)<- CRS('+init=EPSG:32736')
+```
+
+Calculate a raster of the distance from each point to the road
+```{r}
+distance <- gDistance(roads_Malawi, as(distance_raster,"SpatialPoints"), byid=TRUE)
+distance_raster[] = apply(distance,1,min)
+plot(distance_raster)
+dist_roads_original <- distance_raster
+
+dist_roads<- projectRaster(dist_roads_original, crs = CRS('+init=EPSG:4326'))
+crs(dist_roads)<- CRS('+init=EPSG:4326')
+```
+
+Load data on the fraction of a given cell which is classed as urban
+```{r}
+urb_frac.stack <-stack(paste('D:/SMaWal/Latrine management/Data/Population/Data Guru/LAND_USE_HARMONIZATION_V1_1248/data/hurtt_urbanfrac_rcp_2_6.tif',sep=''))
+urb_frac <- crop(urb_frac.stack[[1]],Malawi,snap='out')
+plot(urb_frac)
+```
+
+Ensure rasters all equal size
+```{r}
+pop <- extend(pop_2000,extent(urb_frac))
+```
+
+For each grid cell with information on urban fraction, sum together the distance from roads raster, create a centre of gravity raster and all the population raster
+```{r}
+for(row in 1:nrow(urb_frac)){ 
+  for(col in 1:ncol(urb_frac)){ 
+     x <-  xFromCol(urb_frac,col) - 0.25 
+    y <- yFromRow(urb_frac,row) + 0.25
+    ext <- extent(x,x+0.5,y-0.5,y)
+    pop_cell <- crop(pop,ext)
+    
+    if (is.na(maxValue(pop_cell))== TRUE){
+      print("NA")
+       name<- paste("Pop_cell", row,"_", col, sep = "")
+        assign(name, pop_w)}
+    
+    else if ((is.na(maxValue(pop_cell))== FALSE)){
+    ## Distance to road
+    dist_roads_cell <- crop(dist_roads,ext)
+          dist_roads_cell <- 0.00001 + (max(dist_roads_cell[,])- dist_roads_cell) / (max(dist_roads_cell[,])- min(dist_roads_cell[,])) / 10000
+    
+          ## Ensure grid cells have same extent and origin
+          # template<- projectRaster(pop_cell,dist_roads_cell,method = 'bilinear')
+             #projectRaster(from = pop_cell, to= dist_roads_cell, alignOnly=FALSE)
+      
+          dist_roads_cell<- projectRaster(from = dist_roads_cell, to= pop_cell, alignOnly=FALSE) 
+          template<- projectRaster(pop_cell,dist_roads_cell,method = 'bilinear')
+          pop_rsmp<- projectRaster(from = pop_cell, to= template)
+          
+          ##Population centres- rescaled
+          cog <- as.numeric(COGravity(pop_rsmp, y = NULL, z = NULL, wt = NULL))
+          cog.spdf <- SpatialPointsDataFrame(coords = data.frame(latitude=cog[1],longitude=cog[3],data=1), 
+                                             data = data.frame(data=1), proj4string = CRS("+proj=longlat +datum=WGS84 +ellps=WGS84 +towgs84=0,0,0"))
+          cog_dist <- pop_rsmp;  cog_dist[,] <- NA
+          cog_dist[cellFromXY(cog_dist, cog.spdf) ] <- 1
+          cog_dist <- raster::distance(cog_dist)
+          cog_dist <- 0.00001 + (max(cog_dist[,])- cog_dist) / (max(cog_dist[,])- min(cog_dist[,])) / 10000
+          
+          ## Sum rasters together. Some of the distance to roads raster does not fully complete other grid cells as the roads are too far from the centres. When no distance from roads data is available just use sum of population and centre of population
+          
+          if (is.na(maxValue(dist_roads_cell))==TRUE){
+             pop_w <- pop_rsmp  + cog_dist  
+          }
+          
+             if (is.na(maxValue(dist_roads_cell))==FALSE){
+             pop_w <- pop_rsmp + dist_roads_cell + cog_dist 
+          }
+          
+  ## Assign name to the grid cell
+          name<- paste("Pop_cell", row,"_", col, sep = "")
+        assign(name, pop_w)
+        print(name)
+  }}}
+```
+
+Combine the individual grid cells produced to make large raster of population
+```{r}
+# Create a list of mask names
+mask_names <- paste0("Pop_cell", 1:15, "_", 1:7)
+
+# Use lapply to load the masks and compute the mean mosaic
+mosaic_list <- lapply(mask_names, function(mask_name) {
+  mask <- get(mask_name)
+  mosaic(mask, fun = mean)
+})
+
+# Plot each mosaic
+lapply(mosaic_list, plot)
+
+
+pop_unique<- mask(popp, Malawi)
+
+writeRaster(c,'D:/Future population projections Malawi project/unique_population.tif',format='GTiff', overwrite=TRUE)
+```
+
+'Unique' starting population raster produced. 
+Now to look at historical trends in population growth
+
+Load up required datasets again
+```{r}
+pop_unique<- raster('D:/Future population projections Malawi project/unique_population.tif')
+urb_frac.stack <-stack(paste('D:/SMaWal/Latrine management/Data/Population/Data Guru/LAND_USE_HARMONIZATION_V1_1248/data/hurtt_urbanfrac_rcp_6.tif',sep=''))
+urb_frac <- crop(urb_frac.stack[[1]],pop_unique,snap='out')
+```
+
+Load historical population information
+```{r}
+## World bank data for population and IIASA data for urban fraction (for years 2005, 2010 etc extrapolated and using SPPC1 for years 2010-2020)
+Historical_population<- read.csv('D:/SMaWal/Latrine management/Data/Population/World Bank Malawi Historical Population.csv')
+Historical_population <- Historical_population[,41:61]
+Historical_population[2,]<- c(15.176, 15.608,	16.04,	16.472,	16.904,	17.336,	17.8226,	18.3092,	18.7958,	19.2824,	19.769,	20.4986,	20.4986,	20.4986,	20.4986,	23.417,	24.2242,	25.0314,	25.8386,	26.6458,	27.453)
+Historical_population[3,]<- (100-Historical_population[2,])
+Historical_population[4,]<- (Historical_population[2,]/100)*Historical_population[1,]
+Historical_population[5,]<- (Historical_population[3,]/100)*Historical_population[1,]
+rownames(Historical_population)<- c("Total population", "Urban Percentage", "Rural percentage", "Urban Population", "Rural population")
+```
+
+Starting with the unique population raster, asign population to grid cells
+Historic data (no SSP scenarios)
+```{r}
+### Rank unique population
+
+#Sorting the pixel values within each urban fraction 0.5 degree grid cell and selecting the highest ones as urban until the urban fraction value is fulfilled
+
+population<- pop_unique
+scaling_factor<- 1.0
+
+for (i in 1:20){
+
+for(row in 1:((nrow(urb_frac)))){ 
+  for(col in 1:((ncol(urb_frac)))){ 
+# Locate gridcell, provides coordinates
+x <-  xFromCol(urb_frac,col) - 0.25 
+y <- yFromRow(urb_frac,row) + 0.25
+ext <- extent(x,x+0.5,y-0.5,y)
+
+
+#print(ext)
+
+pop_cell <- crop(population,ext) # crop population to within urb_frac grid cell
+
+## Apply RCP urban fraction level to rank to define those that count as urban and those that don't
+# urb_frac[row, column]. 
+RCP_urban_percentage<- ((urb_frac[row,col])/scaling_factor)
+#print(RCP_urban_percentage)
+RCP_non_urban_percentage<- (1-RCP_urban_percentage)
+#print(RCP_non_urban_percentage)
+
+## Which cells have a value exceeding the cut off based on the RCP? 
+q<- quantile(pop_cell,RCP_non_urban_percentage)
+
+urban_mask <- reclassify(pop_cell, cbind(-Inf, q, NA))
+
+rural_mask<- reclassify(pop_cell, cbind(q, Inf, NA))
+
+name<- paste("Urban_mask_", row,"_", col, sep = "")
+assign(name, urban_mask)
+
+name2<- paste("Rural_mask_", row,"_", col, sep = "")
+assign(name2, rural_mask)
+  }
+  }
+
+# Combine to make urban and rural mask
+urban_masks <- lapply(1:15, function(i) {
+  lapply(1:7, function(j) {
+    get(paste0("Urban_mask_", i, "_", j))
+  })
+})
+
+rural_masks <- lapply(1:15, function(i) {
+  lapply(1:7, function(j) {
+    get(paste0("Rural_mask_", i, "_", j))
+  })
+})
+
+# Create and plot mosaics
+mos <- mosaic(urban_masks, fun = mean)
+plot(mos)
+
+mos2 <- mosaic(rural_masks, fun = mean)
+plot(mos2)
+
+
+
+total_urban_population<- cellStats(mos, sum)
+urban_mask_percent<- (mos/(total_urban_population))
+
+total_rural_population<- cellStats(mos2, sum)
+rural_mask_percent<- (mos2/(total_rural_population))
+
+###
+urban_population<- urban_mask_percent*Historical_population[4,(i+1)]
+rural_population<- rural_mask_percent*Historical_population[5,(i+1)]
+
+population<- (merge(rural_population,urban_population))
+
+nam <- paste("Malawi_population_200", i, sep = "")
+assign(nam, (merge(rural_population,urban_population)))
+ 
+nam <- paste("Rural_population_200", i, sep = "")
+assign(nam, ((rural_population)))
+
+nam <- paste("Urban_population_200", i, sep = "")
+assign(nam, ((urban_population))) 
+ 
+print(nam)
+print(total_urban_population)
+print(total_rural_population) 
+}
+```
+
+```{r}
+##Cropping populations by district
+population_2001<- raster(paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Malawi_population_2001_1.0_adjusted_urb_frac.tif'))
+urban_population_2001<- raster(paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Urban_population_2001_1.0_adjusted_urb_frac.tif'))
+rural_population_2001<- raster(paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Rural_population_2001.tif'))
+ 
+# Example Balaka
+Balaka_2001_pop<- mask(population_2001,Balaka_sp)
+writeRaster(Balaka_2001_pop, 'D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_2001_pop.tif', overwrite=TRUE)
+Balaka_urban_2001_pop<- mask(urban_population_2001,Balaka_sp)
+writeRaster(Balaka_urban_2001_pop, 'D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_urban_2001_pop.tif', overwrite=TRUE)
+Balaka_rural_2001_pop<- mask(rural_population_2001,Balaka_sp)
+writeRaster(Balaka_rural_2001_pop, 'D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_rural_2001_pop.tif', overwrite=TRUE)
+
+```
+Individual districts percentage of population using latrines rural vs urban for historical years 2010-2022 as data only available from 2010 and 2015 census data. 
+Trends in pit latrine usage by looking at change in latrine usage from the 2010 and 2015 census and extrapolating results
+```{r}
+## Individual district latrine adoption statistics
+District_latrines_urban_and_rural<- read.csv('D:/SMaWal/Historic percent pit-latrine usage.csv')
+year<- 2010
+urban_row<- year-2009
+rural_row<- (year+5)-2000
+```
+```{r}
+# For example Balaka 2010
+trad_auth<- st_read("D:/SMaWal/QGIS/Malawi/traditional authorities/Malawi_TA_2018.shp")
+trad_auth<-st_transform(trad_auth, CRS("+proj=longlat +datum=WGS84 +no_defs"))
+trad_auth_single = st_cast(trad_auth,"POLYGON")
+
+Balaka<- trad_auth_single[trad_auth_single$DIST_NAME =="Balaka",]
+Balaka_sp<- as_Spatial(Balaka)
+
+
+## Assume 9.346 users/ latrine urban areas and 12.58 in rural areas
+Balaka_population_2010<- raster(paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_2010_pop.tif'))
+Balaka_urban_population_2010<- raster(paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_urban_2010_pop.tif'))
+Balaka_rural_population_2010<- raster(paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_rural_2010_pop.tif'))
+Balaka_latrines_urban_population_2010<- (Balaka_urban_population_2010/9.346)*(District_latrines_urban_and_rural[urban_row,]$Balaka/100)
+Balaka_latrines_rural_population_2010<- (Balaka_rural_population_2010/12.58)*(District_latrines_urban_and_rural[rural_row,]$Balaka/100)
+Balaka_latrines_2010<- merge(Balaka_latrines_urban_population_2010, Balaka_latrines_rural_population_2010)
+cellStats(Balaka_latrines_2010,sum)
+writeRaster(Balaka_latrines_2010, 'D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_latrines_2010.tif', overwrite= TRUE)
+
+
+Balaka_latrine_users_urban<- (Balaka_urban_population_2010 )*(District_latrines_urban_and_rural[urban_row,]$Balaka/100)
+Balaka_latrine_users_rural<- (Balaka_rural_population_2010 )*(District_latrines_urban_and_rural[rural_row,]$Balaka/100)
+Balaka_latrine_users_2010<- merge(Balaka_latrine_users_rural_2010, Balaka_latrine_users_urban_2010)
+
+writeRaster(Balaka_latrine_users_2010, 'D:/Future population projections Malawi project/Population raster files/Historical raster files/Balaka_latrine_users_2010.tif', overwrite= TRUE)
+```
+### Now looking at future population projections (beyond 2020). Here we look at different scenarios of population growth outlined in SSP scenarios. 
+# We start at the first step again. 
+
+# Read in the shapefile,
+## Get country outline shapefile (Malawi)
+world <- readShapeSpatial("D:/Future population projections Malawi project/Countries zip/ne_10m_admin_0_countries.shp")
+
+plot(world[world$ADMIN=="Malawi",1])
+
+Malawi<- world[world$ADMIN=="Malawi",1]
+```
+
+```{r}
+# Load urban fraction from Hurtt et al., 2011 data. 
+urb_frac.stack <-stack(paste('D:/SMaWal/Latrine management/Data/Population/Data Guru/LAND_USE_HARMONIZATION_V1_1248/data/hurtt_urbanfrac_rcp_2_6.tif',sep=''))
+# Crop urban fraction for country case-study
+urb_frac <- crop(urb_frac.stack[[1]],Malawi,snap='out')
+```
+
+```{r}
+### SSP population and urban fraction projections
+# Load SSP projection from Riahi et al., (2017) SSP projection database 
+SSP_urban_fraction <- read.csv("D:/SMaWal/Latrine management/Data/SSP projections/Malawi SSP projections SSP database.csv")
+
+SSP_population<- read.csv("D:/SMaWal/Latrine management/Data/SSP projections/Malawi population projections under SSP scenarios SSP database.csv")
+
+#Categorise projected populations by SSP scenario
+
+SSP1_pop<- SSP_population[SSP_population$Scenario=="SSP1",]
+SSP2_pop<- SSP_population[SSP_population$Scenario=="SSP2",]
+SSP3_pop<- SSP_population[SSP_population$Scenario=="SSP3",]
+SSP4_pop<- SSP_population[SSP_population$Scenario=="SSP4",]
+SSP5_pop<- SSP_population[SSP_population$Scenario=="SSP5",]
+
+## All population projection scenarios are the same for different models
+# Use "IIASA GDP" model
+SSP1_pop<- SSP1_pop[1,]
+SSP2_pop<- SSP2_pop[1,]
+SSP3_pop<- SSP3_pop[1,]
+SSP4_pop<- SSP4_pop[1,]
+SSP5_pop<- SSP5_pop[1,]
+
+##
+SSP1_urb<- SSP_urban_fraction[SSP_urban_fraction$Scenario=="SSP1",]
+SSP2_urb<- SSP_urban_fraction[SSP_urban_fraction$Scenario=="SSP2",]
+SSP3_urb<- SSP_urban_fraction[SSP_urban_fraction$Scenario=="SSP3",]
+SSP4_urb<- SSP_urban_fraction[SSP_urban_fraction$Scenario=="SSP4",]
+SSP5_urb<- SSP_urban_fraction[SSP_urban_fraction$Scenario=="SSP5",]
+
+###
+#For example of population projection SSP5 (can use alternative)
+
+PopulationprojectionSSP5 <- data.frame(matrix(ncol = 19, nrow = 2))
+naming<- c("2010", "2015", "2020", "2025", "2030", "2035", "2040", "2045", "2050", "2055", "2060", "2065", "2070", "2075", "2080", "2085", "2090", "2095", "2100")
+naming2<- c("Urban", "Rural")
+colnames(PopulationprojectionSSP5)<- naming
+rownames(PopulationprojectionSSP5)<- naming2
+
+for(b in 1:19){
+ PopulationprojectionSSP5[1,b]<- ((SSP5_urb[1,(5+b)])/100)*((SSP5_pop[1,(5+b)])*1000000)
+ PopulationprojectionSSP5[2,b]<- (1-((SSP5_urb[1,(5+b)])/100))*((SSP5_pop[1,(5+b)])*1000000)
+}
+
+
+PopulationprojectionSSP5 <- PopulationprojectionSSP5[,3:19]
+####
+PopulationprojectionSSP5yearly<- matrix(NA,2,81)
+colnames(PopulationprojectionSSP5yearly)<- c(2020:2100)
+
+for (j in 1:16) {
+  i <- ((j - 1) * 5) + 1
+  PopulationprojectionSSP5yearly[1, i:(i + 4)] <- PopulationprojectionSSP5[1, j] + (0:4) * (PopulationprojectionSSP5[1, j + 1] - PopulationprojectionSSP5[1, j]) / 5
+  PopulationprojectionSSP5yearly[2, i:(i + 4)] <- PopulationprojectionSSP5[2, j] + (0:4) * (PopulationprojectionSSP5[2, j + 1] - PopulationprojectionSSP5[2, j]) / 5
+  print(j)
+}
+
+```
+
+For SSP scenario SSP5
+
+For years from 2020-2070 
+```{r}
+### SSP5
+#Sorting the pixel values within each urban fraction 0.5 degree grid cell and selecting the highest ones as urban until the urban fraction value is fulfilled
+## If projecting year 2056 (example, take the population raster for the year before, 2055)
+
+Malawi_population_2055<- raster( paste0('D:/Future population projections Malawi project/Population raster files/SSP5/Malawi_population_2055.tif'))
+
+#Malawi_population_2020<- raster( paste0('D:/Future population projections Malawi project/Population raster files/Historical raster files/Malawi_population_2020_no_adjusted_urb_frac.tif'))
+population<- Malawi_population_2055
+
+## Set urban smoothing factor
+smoothing_factor<- 0.4
+
+for (i in 36:50){
+
+for(row in 1:((nrow(urb_frac)))){ 
+  for(col in 1:((ncol(urb_frac)))){ 
+# Locate gridcell, provides coordinates
+x <-  xFromCol(urb_frac,col) - 0.25 
+y <- yFromRow(urb_frac,row) + 0.25
+ext <- extent(x,x+0.5,y-0.5,y)
+
+pop_cell <- crop(population,ext) 
+# crop population to within urb_frac grid cell
+## Within pop_cell rank pixels according to population
+## Apply RCP urban fraction level to rank to define those that count as urban and those that don't
+# urb_frac[row, column]
+
+RCP_urban_percentage<- ((urb_frac[row,col])/smoothing_factor)
+#print(RCP_urban_percentage)
+RCP_non_urban_percentage<- (1-RCP_urban_percentage)
+#print(RCP_non_urban_percentage)
+
+#print(RCP_urban_percentage)
+## Which cells have a value exceeding the cut off based on the RCP? 
+q<- quantile(pop_cell,RCP_non_urban_percentage)
+
+urban_mask <- reclassify(pop_cell, cbind(-Inf, q, NA))
+
+rural_mask<- reclassify(pop_cell, cbind(q, Inf, NA))
+
+#print("reclassified")
+
+name<- paste("Urban_mask_", row,"_", col, sep = "")
+assign(name, urban_mask)
+
+name2<- paste("Rural_mask_", row,"_", col, sep = "")
+assign(name2, rural_mask)
+## Need to combine together to produce urban mask and rural mask for whole of Malawi
+  }
+  }
+library(gdalUtils)
+
+# Recombine the tiled urban and rural pieces
+urban_masks <- lapply(1:15, function(i) {
+  lapply(1:7, function(j) {
+    get(paste0("Urban_mask_", i, "_", j))
+  })
+})
+
+rural_masks <- lapply(1:15, function(i) {
+  lapply(1:7, function(j) {
+    get(paste0("Rural_mask_", i, "_", j))
+  })
+})
+
+# Create and plot mosaics
+mos <- mosaic(urban_masks, fun = mean)
+plot(mos)
+
+mos2 <- mosaic(rural_masks, fun = mean)
+plot(mos2)
+
+
+###########################
+
+total_urban_population<- cellStats(mos, sum)
+urban_mask_percent<- (mos/(total_urban_population))
+
+total_rural_population<- cellStats(mos2, sum)
+rural_mask_percent<- (mos2/(total_rural_population))
+
+###
+# Distribute the population according the the percentage of the population defined in each cell of the urban and rural masks
+urban_population<- urban_mask_percent*PopulationprojectionSSP5yearly[1,(i+1)]
+rural_population<- rural_mask_percent*PopulationprojectionSSP5yearly[2,(i+1)]
+
+population<- (merge(rural_population,urban_population))
+
+nam <- paste("Malawi_population_20", (i+20), sep = "")
+ assign(nam, (merge(rural_population,urban_population)))
+ 
+nam <- paste("Urban_population_20", (i+20), sep = "")
+ assign(nam, ((urban_population)))
+ 
+nam <- paste("Rural_population_20", (i+20), sep = "")
+ assign(nam, ((rural_population)))
+ 
+print(nam)
+print(total_urban_population)
+print(total_rural_population) 
+}
+
+```
+
+## Now looking at latrine usage
+# Scenario A (constant adoption)
+```{r}
+## Latrine adoption scenario pit latrine usage remains same as was in 2015
+District_latrines_rural<- read.csv('D:/SMaWal/UNICEF Groundwater atlas/2015 pit latrine usage rural.csv')
+District_latrines_rural<- District_latrines_rural[1,]
+District_latrines_urban<- read.csv('D:/SMaWal/UNICEF Groundwater atlas/2015 pit latrine usage urban.csv')
+District_latrines_urban<- District_latrines_urban[1,]
+```
+```{r}
+## Example Bakala 2070
+Balaka_population_2070<- raster(paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_2070_pop.tif'))
+Balaka_urban_population_2070<- raster(paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_urban_2070_pop.tif'))
+Balaka_rural_population_2070<- raster(paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_rural_2070_pop.tif'))
+Balaka_latrines_urban_population_2070<- (Balaka_urban_population_2070/9.346)*(District_latrines_urban$Balaka/100)
+Balaka_latrines_rural_population_2070<- (Balaka_rural_population_2070/12.58)*(District_latrines_rural$Balaka/100)
+Balaka_latrines_2070<- merge(Balaka_latrines_urban_population_2070, Balaka_latrines_rural_population_2070)
+cellStats(Balaka_latrines_2070,sum)
+writeRaster(Balaka_latrines_2070, 'D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_latrines_2070.tif', overwrite= TRUE)
+
+
+Balaka_latrine_users_urban_population_2070<- (Balaka_urban_population_2070 )*(District_latrines_urban$Balaka/100)
+Balaka_latrine_users_rural_population_2070<- (Balaka_rural_population_2070 )*(District_latrines_rural$Balaka/100)
+Balaka_latrine_users_2070<- merge(Balaka_latrine_users_urban_population_2070, Balaka_latrine_users_rural_population_2070)
+
+writeRaster(Balaka_latrine_users_2070,'D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_latrine_users_2070.tif', overwrite= TRUE)
+```
+
+#Scenarios B or C (just change the CSV file path)
+```{r}
+#Taking the example Balaka 2055
+
+#load the data file giving estimated pit-latrine usage for each district in 2020 and in 2070
+Scenario_B<- read.csv('D:/Future population projections Malawi project/Pit-latrine contamination full dataset/Percent pit-latrine use population/Scenario B  pit-latrine usage by district.csv')
+District_latrines_rural<- District_latrines_rural[1,]
+# Use the lm() function to create a linear model between 2020 and 2070 estimates
+year <- c(2020, 2070)
+urban_value <- c(Scenario_B$Balaka[1], Scenario_B$Balaka[2]) 
+rural_value <- c(Scenario_B$Balaka[4], Scenario_B$Balaka[5]) 
+# Create a data frame for the linear model
+urban_estimate <- data.frame(year, urban_value)
+rural_estimate <- data.frame(year, rural_value)
+# Fit a linear regression model
+
+urban_model <- lm(value ~ year, data = urban_estimate)
+rural_model <- lm(value ~ year, data = rural_estimate)
+# Specify the year for which you want to estimate the value of pit-latrine usage (e.g., 2050)
+new_year <- 2055
+new_data <- data.frame(year = new_year)
+
+# Use the model to predict the value for the new year
+urban_estimate_value <- predict(model, urban_model = new_data)
+rural_estimate_value <- predict(model, rural_model = new_data)
+
+#Input the estimated values into the district population
+
+Balaka_population_2055<- raster(paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_2055_pop.tif'))
+Balaka_urban_population_2055<- raster(paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_urban_2055_pop.tif'))
+Balaka_rural_population_2055<- raster(paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_rural_2055_pop.tif'))
+
+Balaka_latrines_urban_population_2055<- (Balaka_urban_population_2055/9.346)*(urban_estimate_value/100)
+Balaka_latrines_rural_population_2055<- (Balaka_rural_population_2055/12.58)*(rural_estimate_value/100)
+
+Balaka_latrines_2055<- merge(Balaka_latrines_urban_population_2055, Balaka_latrines_rural_population_2055)
+
+writeRaster(Balaka_latrines_2055, 'D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_latrines_2055.tif', overwrite= TRUE)
+
+
+Balaka_latrine_users_urban_population_2055<- (Balaka_urban_population_2055 )*(urban_estimate_value/100)
+Balaka_latrine_users_rural_population_2055<- (Balaka_rural_population_2055 )*(rural_estimate_value/100)
+Balaka_latrine_users_2055<- merge(Balaka_latrine_users_urban_population_2055, Balaka_latrine_users_rural_population_2055)
+
+writeRaster(Balaka_latrine_users_2055,'D:/Future population projections Malawi project/Population raster files/SSP2/Balaka_latrine_users_2055.tif', overwrite= TRUE)
+```
+## To look at the whole country, merge individual districts together again
+Then break down into individual WRUs
+```{r}
+# Example WRU 1A
+WRU<- st_read("D:/SMaWal/Latrine management/Data/WRU/Files/WRA and WRU/WRU.shp")
+WRU<-st_transform(WRU, CRS("+proj=longlat +datum=WGS84 +no_defs"))
+
+WRU_single = st_cast(WRU,"POLYGON")
+WRU_1A<- WRU_single[WRU_single$WATER_RESO=="1A",]
+WRU_1A_sp<- as_Spatial(WRU_1A[1,])
+
+Malawi_latrine_users_2070<- raster( paste0('D:/Future population projections Malawi project/Population raster files/SSP2/Malawi_whole_latrine_users_population_2070.tif'))
+year<- 2070
+
+## Create data frame to input estimates of latrine users per WRU
+latrines_users_df <- data.frame(matrix(ncol = 2, nrow = 67))
+
+x <- c( "WRU","2070")
+colnames(latrines_users_df)<- x
+
+latrines_users_df[1,]$`2070` <- cellStats((mask(Malawi_latrine_users_2070,WRU_1A_sp)),sum)
+```
+## Create presence/ absence raster to identify where vulnerable boreholes are
+```{r}
+# Load the raster package
+library(raster)
+
+# Set the extent and resolution of the grid (3-arc seconds)
+xmin <- 20
+xmax <- 40
+ymin <- -17
+ymax <- -9.5
+res <- 1/120  # 3-arc seconds
+
+# Create an empty raster with the specified extent and resolution
+r <- raster(extent(xmin, xmax, ymin, ymax), res = res)
+
+# Load data frame with point coordinates of vulnerable water-points
+points <- read.csv('D:/Future population projections Malawi project/Pit-latrine contamination full dataset/Boreholes and latrine colocalisation rasters/vulnerable_water_point_locations.csv')
+
+points <- data.frame(latitude = points$Latitude, longitude = points$Longitude)
+
+x_indices <- floor((points$longitude - xmin) / res)
+y_indices <- floor((points$latitude - ymin) / res)
+
+
+# Create an empty raster with presence/absence values
+presence_absence_raster <- raster(extent(xmin, xmax, ymin, ymax), res = res)
+presence_absence_raster[] <- 0  # Initialize all cells to 0 (absence)
+
+# Assign presence (1) to grid cells corresponding to the point locations
+presence_absence_raster[cbind(x_indices, y_indices)] <- 1
+
+# Plot the presence/absence raster
+plot(presence_absence_raster, main = "Presence/Absence Raster")
+
+```
+
+```{r}
+##Find cases of latrines where there are boreholes in the same cell
+raster_boreholes_and_latrines_2020 <- mask(Malawi_latrines_2020, presence_absence_raster, maskvalue=NA)
+
+## Identify cases over given thresholds, e.g. over 100 latrines for year 2070
+Total_raster_boreholes_and_latrines_2070_under_100<-sum(freq(raster_boreholes_and_latrines_2070)[1:95,2])
+Total_raster_boreholes_and_latrines_2070<-sum(freq(raster_boreholes_and_latrines_2070)[1:((nrow(freq(raster_boreholes_and_latrines_2070)))-1),2])
+
+raster_boreholes_and_latrines_2070_NAs<- freq(raster_boreholes_and_latrines_2070)[(nrow(freq(raster_boreholes_and_latrines_2070))),2]
+
+Proportion_raster_boreholes_and_latrines_2070_under_100<- Total_raster_boreholes_and_latrines_2070_under_100/Total_raster_boreholes_and_latrines_2070
+
+raster_boreholes_and_latrines_2070_100_and_over_number<- Total_raster_boreholes_and_latrines_2070-Total_raster_boreholes_and_latrines_2070_under_100
+```
+
